@@ -75,6 +75,7 @@ class Trainer:
         import deepxde as dde
 
         if self.device[0] != 'cpu':
+            print(self.device)
             device = "cuda:" + self.device[0]
             torch.cuda.set_device(device)
             torch.set_default_tensor_type(torch.cuda.FloatTensor)
