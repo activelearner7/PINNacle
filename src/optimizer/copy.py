@@ -52,7 +52,7 @@ class ParamScheduler:
         self.grouped_losses = grouped_losses
 
 
-def sadam(params, list_grad_groups, m, v,list_state_count, beta1, beta2, lr, eps,  group_weights):
+def sadam(params, grads, exp_avgs, exp_avg_sqs,state_steps, beta1, beta2, lr, eps,  group_weights):
 
 
     r"""Functional API that performs MultiAdam algorithm computation.
@@ -62,21 +62,21 @@ def sadam(params, list_grad_groups, m, v,list_state_count, beta1, beta2, lr, eps
 
     # n_group is num of different group_weights
     # n_params is the number of all params
-    n_groups, n_params = len(list_grad_groups), len(list_grad_groups[0])
-    list_grad_groups_cat, m_cat, v_cat= [], [], []
+    n_groups, n_params = len(grads), len(grads[0])
+    grads_cat, exp_avgs_cat, exp_avg_sqs_cat= [], [], []
 
     for i in range(n_params):
-        list_grad_groups_cat.append(torch.stack([list_grad_groups[j][i] for j in range(n_groups)]))
-        m_cat.append(torch.stack([m[j][i] for j in range(n_groups)]))
-        v_cat.append(torch.stack([v[j][i] for j in range(n_groups)]))
+        grads_cat.append(torch.stack([grads[j][i] for j in range(n_groups)]))
+        exp_avgs_cat.append(torch.stack([exp_avgs[j][i] for j in range(n_groups)]))
+        exp_avg_sqs_cat.append(torch.stack([exp_avg_sqs[j][i] for j in range(n_groups)]))
 
 
     for i, param in enumerate(params):
 
-        grad = -list_grad_groups_cat[i]  # torch.stack([p.grad for different losses])
-        m_curr = m_cat[i]
-        m_curr_sq = v_cat[i]
-        step = list_state_count[i]
+        grad = -grads_cat[i]  # torch.stack([p.grad for different losses])
+        exp_avg = exp_avgs_cat[i]
+        exp_avg_sq = exp_avg_sqs_cat[i]
+        step = state_steps[i]
 
         bias_correction1 = 1 - beta1**step
         bias_correction2 = 1 - beta2**step
@@ -84,16 +84,16 @@ def sadam(params, list_grad_groups, m, v,list_state_count, beta1, beta2, lr, eps
 
 
         # Decay the first and second moment running average coefficient
-        m_curr.mul_(beta1).add_(grad, alpha=1 - beta1)
-        m_curr_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
 
         
-        denom = (m_curr_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+        denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
 
         step_size = lr / bias_correction1
 
-        update_raw = m_curr / denom  # raw update for every loss group
-        update = (update_raw * group_weights.view((-1, ) + (1, ) * (m_curr.dim() - 1))).sum(dim=0)  # weighted sum for current param
+        update_raw = exp_avg / denom  # raw update for every loss group
+        update = (update_raw * group_weights.view((-1, ) + (1, ) * (exp_avg.dim() - 1))).sum(dim=0)  # weighted sum for current param
 
       
 
@@ -102,8 +102,8 @@ def sadam(params, list_grad_groups, m, v,list_state_count, beta1, beta2, lr, eps
     # update states
     for i in range(n_groups):
         for j in range(n_params):
-            m[i][j].copy_(m_cat[j][i])
-            v[i][j].copy_(v_cat[j][i])
+            exp_avgs[i][j].copy_(exp_avgs_cat[j][i])
+            exp_avg_sqs[i][j].copy_(exp_avg_sqs_cat[j][i])
 
 
 
@@ -142,13 +142,13 @@ class MultiAdam(Optimizer):
                 state = self.state[p]
                 state['step'] = 0
                 # Exponential moving average of gradient values
-                state['m_curr'] = [torch.zeros_like(p, memory_format=torch.preserve_format) for _ in range(self.n_groups)]
+                state['exp_avg'] = [torch.zeros_like(p, memory_format=torch.preserve_format) for _ in range(self.n_groups)]
                 # Exponential moving average of squared gradient values
-                state['m_curr_sq'] = [torch.zeros_like(p, memory_format=torch.preserve_format) for _ in range(self.n_groups)]
+                state['exp_avg_sq'] = [torch.zeros_like(p, memory_format=torch.preserve_format) for _ in range(self.n_groups)]
                 # Maintains max of all exp. moving avg. of sq. grad. values
-                state['max_m_curr_sq'] = [torch.zeros_like(p, memory_format=torch.preserve_format) for _ in range(self.n_groups)]
-                state['agg_m_curr'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                state['agg_v'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                state['max_exp_avg_sq'] = [torch.zeros_like(p, memory_format=torch.preserve_format) for _ in range(self.n_groups)]
+                state['agg_exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                state['agg_exp_avg_sqs'] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
         self.is_init_state = False
 
@@ -174,13 +174,13 @@ class MultiAdam(Optimizer):
         self.param_scheduler.step(losses=self.losses, grouped_losses=grouped_losses)
 
         params_with_grad = []
-        list_grad_groups_groups = []
-        m_groups = []
-        v_groups = []
-        # max_v_groups = []
+        grads_groups = []
+        exp_avgs_groups = []
+        exp_avg_sqs_groups = []
+        # max_exp_avg_sqs_groups = []
 
-        # agg_m_curr = []
-        # agg_v = []
+        # agg_exp_avg = []
+        # agg_exp_avg_sqs = []
 
         if self.is_init_state:
             self.init_states()
@@ -189,54 +189,54 @@ class MultiAdam(Optimizer):
             loss.backward(retain_graph=True)
 
             for group in self.param_groups:
-                list_grad_groups = []
-                m = []
-                v = []
+                grads = []
+                exp_avgs = []
+                exp_avg_sqs = []
 
 
-                # update loss specific parameters: p.grad, m_curr, m_curr_sq, max_m_curr_sq
+                # update loss specific parameters: p.grad, exp_avg, exp_avg_sq, max_exp_avg_sq
                 for p in group['params']:
                     if p.grad is not None:
                         params_with_grad.append(p)
-                        list_grad_groups.append(p.grad.clone())
+                        grads.append(p.grad.clone())
                         p.grad.zero_()
 
                         state = self.state[p]
 
-                        m.append(state['m_curr'][i])
-                        v.append(state['m_curr_sq'][i])
+                        exp_avgs.append(state['exp_avg'][i])
+                        exp_avg_sqs.append(state['exp_avg_sq'][i])
 
 
 
 
 
-                list_grad_groups_groups.append(list_grad_groups)
-                m_groups.append(m)
-                v_groups.append(v)
+                grads_groups.append(grads)
+                exp_avgs_groups.append(exp_avgs)
+                exp_avg_sqs_groups.append(exp_avg_sqs)
 
 
         with torch.no_grad():
             temp=self.param_groups
             for group in self.param_groups:
                 params_with_grad = []
-                list_state_count = []
+                state_steps = []
                 for p in group['params']:
                     if p.grad is not None:
                         params_with_grad.append(p)
                         # update the steps for each param group update
                         self.state[p]['step'] += 1
-                        list_state_count.append(self.state[p]['step'])
+                        state_steps.append(self.state[p]['step'])
 
                 beta1, beta2 = self.param_scheduler.betas()
                 
                 sadam(
                     params=params_with_grad,  # list of params(which has grad)
                     # list[list[Tensor]]: dim0 is different loss_group,
-                    # dim1 is list_grad_groups of every params for different losses
-                    list_grad_groups=list_grad_groups_groups,
-                    m=m_groups,
-                    v=v_groups,
-                    list_state_count=list_state_count,
+                    # dim1 is grads of every params for different losses
+                    grads=grads_groups,
+                    exp_avgs=exp_avgs_groups,
+                    exp_avg_sqs=exp_avg_sqs_groups,
+                    state_steps=state_steps,
                     beta1=beta1,
                     beta2=beta2,
                     lr=self.param_scheduler.lr(),
